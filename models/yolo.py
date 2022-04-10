@@ -88,6 +88,18 @@ class Detect(nn.Module):
         anchor_grid = (self.anchors[i] * self.stride[i]).view((1, self.na, 1, 1, 2)).expand(shape)
         return grid, anchor_grid
 
+    def set_num_classes(self, new_num_classes):
+        self.nc = new_num_classes  # number of classes
+        self.no = new_num_classes + 5  # number of outputs per anchor
+
+        for i in range(len(self.m)):
+            new_conv_layer = nn.Conv2d(self.m[i].in_channels, self.no * self.na, 1, device=self.m[i].weight.device)
+            with torch.no_grad():
+                new_conv_layer.weight[:self.m[i].out_channels, :, :, :] = self.m[i].weight[:new_conv_layer.out_channels, :, :, :]
+                new_conv_layer.bias[:self.m[i].out_channels] = self.m[i].bias[:new_conv_layer.out_channels]
+                new_conv_layer.bias[self.m[i].out_channels:] += (torch.sum(self.m[i].bias[5:]) / torch.numel(self.m[i].bias[5:]))
+            self.m[i] = new_conv_layer
+
 
 class Model(nn.Module):
     # YOLOv5 model
