@@ -49,10 +49,10 @@ def item_labeler(collection, label):
     return ((label, item) for item in collection)
 
 
-def most_common_categories(dataset: LoadImagesAndLabels, num_categories: int):
+def most_common_categories(dataset: LoadImagesAndLabels):
     all_labels = np.concatenate([dataset.labels[idx][:, 0] for idx in dataset.indices], axis=0).astype('int64')
     label_counts = np.bincount(all_labels)
-    return set(np.argsort(label_counts)[-num_categories:])
+    return np.argsort(label_counts)[::-1]
 
 
 class ImageLabelSampler(torch.utils.data.Sampler):
@@ -86,7 +86,7 @@ class ImageLabelSampler(torch.utils.data.Sampler):
 
 
 def run_forward_pass(model: Model, imgs: torch.Tensor, targets: torch.Tensor, loss_fn: ComputeLoss):
-    total_mistakes = 0
+    total_mistakes = torch.zeros((len(used_categories),), dtype=torch.int64, device=imgs.device)
 
     translated_targets = torch.clone(targets)
     translated_targets[:, 1].apply_(dataset_labels_to_new_labels.get)
@@ -100,12 +100,13 @@ def run_forward_pass(model: Model, imgs: torch.Tensor, targets: torch.Tensor, lo
 
         for i, det_list in enumerate(processed_pred):
             true_class_entries = translated_targets[translated_targets[:, 0] == i][:, 1].type(torch.int64)
-            true_class_counts = torch.bincount(true_class_entries, minlength=offline_categories)
-            class_counts = torch.bincount(det_list[:, -1].type(torch.int64), minlength=offline_categories)
-            total_mistakes += torch.sum(torch.abs(true_class_counts - class_counts))
+            true_class_counts = torch.bincount(true_class_entries, minlength=len(used_categories))
+            class_counts = torch.bincount(det_list[:, -1].type(torch.int64), minlength=len(used_categories))
+            total_mistakes += torch.abs(true_class_counts - class_counts)
             # print(f'Image {i}: Found {det_list[:, -1]}')
 
-    return loss, total_mistakes
+    all_true_class_counts = torch.bincount(translated_targets[:, 1].type(torch.int64), minlength=len(used_categories))
+    return loss, total_mistakes, all_true_class_counts
 
 
 device = torch.device('cuda:0')
@@ -126,15 +127,19 @@ model_hyp_file = './data/hyps/hyp.scratch-low.yaml'
 input_img_size = 640
 batch_size = 16
 offline_categories = 5
-offline_phase_epochs = 9999
+total_epochs = 9999
 val_interval = 1
+max_replay_cache_size = 50
+rng = np.random.default_rng()
 
-category_add_schedule = lambda epoch: 1 if (epoch + 1) % 10 == 0 else 0
+category_add_schedule = lambda epoch: 1 if (epoch + 1) % 20 == 0 else 0
 
 ch = 3
 # s = 256
 
 if __name__ == '__main__':
+    torch.set_printoptions(profile='full')
+
     saved_model = torch.load(base_weights_path, map_location='cpu')
     saved_model_state = saved_model['model'].float().state_dict()
 
@@ -171,11 +176,16 @@ if __name__ == '__main__':
     # imgsz = check_img_size(input_img_size, gs, floor=gs * 2)  # verify imgsz is gs-multiple
 
     train_loader, train_dataset = create_dataloader(train_data_file, input_img_size, batch_size, 32, workers=0,
-                                                    sampler=lambda dataset: ImageLabelSampler(dataset, most_common_categories(dataset, offline_categories)))
+                                                    sampler=lambda dataset: ImageLabelSampler(dataset, set()))
     val_loader, val_dataset = create_dataloader(val_data_file, input_img_size, batch_size, 32, workers=0,
-                                                    sampler=lambda dataset: ImageLabelSampler(dataset, train_loader.sampler.selected_categories))
+                                                    sampler=lambda dataset: ImageLabelSampler(dataset, set()))
+    sorted_categories = most_common_categories(train_dataset)
+    used_categories = set(sorted_categories[:offline_categories])
 
-    dataset_labels_to_new_labels = {ds_label: idx for idx, ds_label in enumerate(train_loader.sampler.selected_categories)}
+    train_loader.sampler.update_categories(train_dataset, used_categories)
+    val_loader.sampler.update_categories(val_dataset, used_categories)
+
+    dataset_labels_to_new_labels = {ds_label: idx for idx, ds_label in enumerate(used_categories)}
 
     # all_labels = np.concatenate([dataset.labels[idx][:, 0] for idx in dataset.indices], axis=0).astype('int64')
     # label_counts = np.bincount(all_labels)
@@ -205,68 +215,82 @@ if __name__ == '__main__':
     loss_fn = ComputeLoss(base_model)
     optimizer = SGD(base_model.parameters(), lr=base_model.hyp['lr0'])
 
-    batch_cache = [(imgs, targets, paths) for (imgs, targets, paths, _)
-                   in tqdm.tqdm(train_loader, desc='Caching offline training batches...', file=sys.stdout)]
+    replay_cache = [(imgs, targets, paths) for (imgs, targets, paths, _)
+                    in tqdm.tqdm(train_loader, desc='Caching offline training batches...', file=sys.stdout)]
 
 
-    for epoch in range(offline_phase_epochs):
+    for epoch in range(total_epochs):
         categories_to_add = category_add_schedule(epoch)
 
         if categories_to_add > 0:
             print(f'Adding {categories_to_add} {"category" if categories_to_add == 1 else "categories"}...')
 
-            offline_categories += categories_to_add
-            train_loader.sampler.update_categories(train_dataset, most_common_categories(train_dataset, offline_categories))
-            val_loader.sampler.update_categories(val_dataset, train_loader.sampler.selected_categories)
+            new_category_set = set(sorted_categories[len(used_categories):len(used_categories) + categories_to_add])
+            used_categories.update(new_category_set)
+            train_loader.sampler.update_categories(train_dataset, new_category_set)
+            val_loader.sampler.update_categories(val_dataset, used_categories)
 
             for category in train_loader.sampler.selected_categories:
-                if category not in dataset_labels_to_new_labels:
-                    dataset_labels_to_new_labels[category] = len(dataset_labels_to_new_labels)
+                assert category not in dataset_labels_to_new_labels
+                dataset_labels_to_new_labels[category] = len(dataset_labels_to_new_labels)
 
-            assert len(dataset_labels_to_new_labels) == offline_categories
+            assert len(dataset_labels_to_new_labels) == len(used_categories)
 
-            base_model.model[-1].set_num_classes(offline_categories)
+            base_model.model[-1].set_num_classes(len(used_categories))
             loss_fn = ComputeLoss(base_model)
             optimizer = SGD(base_model.parameters(), lr=base_model.hyp['lr0'])
-            batch_cache = [(imgs, targets, paths) for (imgs, targets, paths, _)
-                           in tqdm.tqdm(train_loader, desc='Re-caching offline training batches...', file=sys.stdout)]
+            replay_cache += [(imgs, targets, paths) for (imgs, targets, paths, _)
+                             in tqdm.tqdm(train_loader, desc='Reading online training batches...', file=sys.stdout)]
+
+            if len(replay_cache) > max_replay_cache_size:
+                prune_items = set(rng.choice(len(replay_cache), len(replay_cache) - max_replay_cache_size, replace=False))
+                replay_cache = [x for i, x in enumerate(replay_cache) if i not in prune_items]
+                assert len(replay_cache) == max_replay_cache_size
 
         imgs: torch.Tensor  # Batch of image tensors (batch size * channels * imgsz * imgsz)
         targets: torch.Tensor  # Batch of labels (batch size * 6)
 
         losses = []
-        total_mistakes = 0
+        total_mistakes = torch.zeros((len(used_categories),), dtype=torch.int64, device=device)
+        total_labels = torch.clone(total_mistakes)
 
         # train_conf_mat = torch.zeros(offline_categories, offline_categories, dtype=torch.int64)
 
-        for imgs, targets, paths in tqdm.tqdm(batch_cache, desc=f'Training epoch {epoch}...', file=sys.stdout):  # batch -----------------------------------------------
+        for batch_num, (imgs, targets, paths) in enumerate(tqdm.tqdm(replay_cache, desc=f'Training epoch {epoch}...', file=sys.stdout)):  # batch -----------------------------------------------
             imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
             optimizer.zero_grad()
 
-            loss, mistakes = run_forward_pass(base_model, imgs, targets, loss_fn)
+            loss, mistakes, these_class_counts = run_forward_pass(base_model, imgs, targets, loss_fn)
             total_mistakes += mistakes
+            total_labels += these_class_counts
             losses.append(loss)
 
             loss.backward()
             optimizer.step()
 
-        print(f'Epoch {epoch} training: Total mistakes: {total_mistakes} ({train_loader.sampler.num_labels} total'
-              f'labels, total losses: {sum(losses)}')
+        # total_labels = sum(targets.shape[0] for _, targets, _ in replay_cache)
+        print(f'Epoch {epoch} training: Mistake breakdown: {torch.div(total_mistakes, total_labels)} ({torch.sum(total_mistakes).item()} '
+              f'total mistakes, {torch.sum(total_labels).item()} total '
+              f'labels, total losses: {sum(losses).item()})')
 
         if (epoch + 1) % val_interval == 0:
-            total_mistakes = 0
+            total_mistakes = torch.zeros((len(used_categories),), dtype=torch.int64, device=device)
+            total_labels = torch.clone(total_mistakes)
             losses = []
-            for imgs, targets, paths, _ in tqdm.tqdm(val_loader, desc='Validating model...', file=sys.stdout):
+
+            for batch_num, (imgs, targets, paths, _) in enumerate(tqdm.tqdm(val_loader, desc='Validating model...', file=sys.stdout)):
                 imgs = imgs.to(device, non_blocking=True).float() / 255
 
                 with torch.no_grad():
-                    loss, mistakes = run_forward_pass(base_model, imgs, targets, loss_fn)
+                    loss, mistakes, these_class_counts = run_forward_pass(base_model, imgs, targets, loss_fn)
 
                 total_mistakes += mistakes
+                total_labels += these_class_counts
                 losses.append(loss)
 
-            print(f'Epoch {epoch} validation: Total mistakes: {total_mistakes} ({val_loader.sampler.num_labels} total'
-                  f'labels, total losses: {sum(losses)}')
+            print(f'Epoch {epoch} validation: Mistake breakdown: {torch.div(total_mistakes, total_labels)} ({torch.sum(total_mistakes).item()} '
+                  f'total mistakes, {torch.sum(total_labels).item()} total '
+                  f'labels, total losses: {sum(losses).item()})')
 
     # tl_train_cache = [base_model(batch_info[0].to(device).float() / 255).cpu() for batch_info in
     #                   tqdm.tqdm(train_loader, desc="Caching forward values for transfer learning...")]
