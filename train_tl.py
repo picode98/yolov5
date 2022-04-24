@@ -14,6 +14,7 @@ from models.yolo import Model, Detect
 from utils.datasets import create_dataloader, LoadImagesAndLabels
 from utils.general import check_img_size, non_max_suppression
 from utils.loss import ComputeLoss
+from utils.loggers.csv import CSVLogger
 import val
 
 
@@ -73,7 +74,7 @@ class ImageLabelSampler(torch.utils.data.Sampler):
         self.img_idx_list = []
         for idx in dataset.indices:
             img_label_set = set(dataset.labels[idx][:, 0])
-            if len(img_label_set) > 0 and img_label_set.issubset(self.selected_categories):
+            if len(img_label_set) > 0 and not img_label_set.isdisjoint(self.selected_categories):
                 self.img_idx_list.append(idx)
 
         self.num_labels = sum(len(dataset.labels[idx]) for idx in self.img_idx_list)
@@ -83,6 +84,21 @@ class ImageLabelSampler(torch.utils.data.Sampler):
 
     def __len__(self):
         return len(self.img_idx_list)
+
+
+def filter_image_labels(categories: Iterable[int], label_batch: torch.Tensor):
+    labels_in_set = sum(label_batch[:, 1] == item for item in categories).bool()
+    return label_batch[labels_in_set]
+
+
+def resample(items: Sized, count: int):
+    if len(items) > count:
+        prune_items = set(rng.choice(len(items), len(items) - count, replace=False))
+        new_items = [x for i, x in enumerate(items) if i not in prune_items]
+        assert len(new_items) == count
+        return new_items
+    else:
+        return list(items)
 
 
 def run_forward_pass(model: Model, imgs: torch.Tensor, targets: torch.Tensor, loss_fn: ComputeLoss):
@@ -111,8 +127,8 @@ def run_forward_pass(model: Model, imgs: torch.Tensor, targets: torch.Tensor, lo
 
 device = torch.device('cuda:0')
 
-train_data_file = 'K:\\cse583\\project_data\\coco\\train2017.txt'
-val_data_file = '../datasets/coco/val2017.txt'
+train_data_file = 'K:\\cse583\\project_data\\VOC\\images\\train2007'
+val_data_file = 'K:\\cse583\\project_data\\VOC\\images\\val2007'
 base_model_path = './models/yolov5s_tl_base.yaml'
 base_weights_path = './yolov5s.pt'
 
@@ -127,9 +143,11 @@ model_hyp_file = './data/hyps/hyp.scratch-low.yaml'
 input_img_size = 640
 batch_size = 16
 offline_categories = 5
-total_epochs = 9999
+total_epochs = 80
 val_interval = 1
+val_size = 20
 max_replay_cache_size = 50
+online_add_size = 10
 rng = np.random.default_rng()
 
 category_add_schedule = lambda epoch: 1 if (epoch + 1) % 20 == 0 else 0
@@ -138,7 +156,8 @@ ch = 3
 # s = 256
 
 if __name__ == '__main__':
-    torch.set_printoptions(profile='full')
+    # torch.set_printoptions(profile='full')
+    csv_logger = CSVLogger('./output.csv')
 
     saved_model = torch.load(base_weights_path, map_location='cpu')
     saved_model_state = saved_model['model'].float().state_dict()
@@ -183,7 +202,11 @@ if __name__ == '__main__':
     used_categories = set(sorted_categories[:offline_categories])
 
     train_loader.sampler.update_categories(train_dataset, used_categories)
+    train_loader.sampler.img_idx_list = resample(train_loader.sampler.img_idx_list, max_replay_cache_size * batch_size)
+    used_train_images = set(train_loader.sampler.img_idx_list)
+
     val_loader.sampler.update_categories(val_dataset, used_categories)
+    val_loader.sampler.img_idx_list = resample(val_loader.sampler.img_idx_list, val_size * batch_size)
 
     dataset_labels_to_new_labels = {ds_label: idx for idx, ds_label in enumerate(used_categories)}
 
@@ -227,10 +250,15 @@ if __name__ == '__main__':
 
             new_category_set = set(sorted_categories[len(used_categories):len(used_categories) + categories_to_add])
             used_categories.update(new_category_set)
-            train_loader.sampler.update_categories(train_dataset, new_category_set)
-            val_loader.sampler.update_categories(val_dataset, used_categories)
+            train_loader.sampler.update_categories(train_dataset, used_categories)
+            train_loader.sampler.img_idx_list = resample([idx for idx in train_loader.sampler.img_idx_list
+                                                          if idx not in used_train_images], online_add_size * batch_size)
+            used_train_images.update(train_loader.sampler.img_idx_list)
 
-            for category in train_loader.sampler.selected_categories:
+            val_loader.sampler.update_categories(val_dataset, used_categories)
+            val_loader.sampler.img_idx_list = resample(val_loader.sampler.img_idx_list, val_size * batch_size)
+
+            for category in new_category_set:
                 assert category not in dataset_labels_to_new_labels
                 dataset_labels_to_new_labels[category] = len(dataset_labels_to_new_labels)
 
@@ -242,10 +270,7 @@ if __name__ == '__main__':
             replay_cache += [(imgs, targets, paths) for (imgs, targets, paths, _)
                              in tqdm.tqdm(train_loader, desc='Reading online training batches...', file=sys.stdout)]
 
-            if len(replay_cache) > max_replay_cache_size:
-                prune_items = set(rng.choice(len(replay_cache), len(replay_cache) - max_replay_cache_size, replace=False))
-                replay_cache = [x for i, x in enumerate(replay_cache) if i not in prune_items]
-                assert len(replay_cache) == max_replay_cache_size
+            replay_cache = resample(replay_cache, max_replay_cache_size)
 
         imgs: torch.Tensor  # Batch of image tensors (batch size * channels * imgsz * imgsz)
         targets: torch.Tensor  # Batch of labels (batch size * 6)
@@ -258,6 +283,7 @@ if __name__ == '__main__':
 
         for batch_num, (imgs, targets, paths) in enumerate(tqdm.tqdm(replay_cache, desc=f'Training epoch {epoch}...', file=sys.stdout)):  # batch -----------------------------------------------
             imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
+            targets = filter_image_labels(used_categories, targets)
             optimizer.zero_grad()
 
             loss, mistakes, these_class_counts = run_forward_pass(base_model, imgs, targets, loss_fn)
@@ -269,6 +295,12 @@ if __name__ == '__main__':
             optimizer.step()
 
         # total_labels = sum(targets.shape[0] for _, targets, _ in replay_cache)
+
+        log_items = {'epoch': epoch, 'total_mistakes': torch.sum(total_mistakes).item(),
+                     'total_labels': torch.sum(total_labels).item(), 'total_losses': sum(losses).item(),
+                     'num_classes': len(used_categories), 'class_set': used_categories}
+        csv_logger.log(log_items)
+
         print(f'Epoch {epoch} training: Mistake breakdown: {torch.div(total_mistakes, total_labels)} ({torch.sum(total_mistakes).item()} '
               f'total mistakes, {torch.sum(total_labels).item()} total '
               f'labels, total losses: {sum(losses).item()})')
@@ -280,6 +312,7 @@ if __name__ == '__main__':
 
             for batch_num, (imgs, targets, paths, _) in enumerate(tqdm.tqdm(val_loader, desc='Validating model...', file=sys.stdout)):
                 imgs = imgs.to(device, non_blocking=True).float() / 255
+                targets = filter_image_labels(used_categories, targets)
 
                 with torch.no_grad():
                     loss, mistakes, these_class_counts = run_forward_pass(base_model, imgs, targets, loss_fn)
@@ -294,3 +327,5 @@ if __name__ == '__main__':
 
     # tl_train_cache = [base_model(batch_info[0].to(device).float() / 255).cpu() for batch_info in
     #                   tqdm.tqdm(train_loader, desc="Caching forward values for transfer learning...")]
+
+    csv_logger.close()
