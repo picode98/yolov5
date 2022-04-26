@@ -16,6 +16,7 @@ from utils.general import check_img_size, non_max_suppression
 from utils.loss import ComputeLoss
 from utils.loggers.csv import CSVLogger
 import val
+from utils.metrics import box_iou
 
 
 def round_robin(sources: Iterable[Iterable]):
@@ -101,12 +102,23 @@ def resample(items: Sized, count: int):
         return list(items)
 
 
+def values_of(t: torch.Tensor):
+    if torch.numel(t) > 1:
+        return list(values_of(sub_t) for sub_t in t)
+    else:
+        return t.item()
+
+
 def run_forward_pass(model: Model, imgs: torch.Tensor, targets: torch.Tensor, loss_fn: ComputeLoss):
     total_mistakes = torch.zeros((len(used_categories),), dtype=torch.int64, device=imgs.device)
+    total_iou_matches = torch.zeros((len(used_categories),), dtype=torch.float, device=imgs.device)
 
     translated_targets = torch.clone(targets)
     translated_targets[:, 1].apply_(dataset_labels_to_new_labels.get)
     translated_targets = translated_targets.to(device)
+
+    target_xyxys = torch.clone(translated_targets[:, 2:6]) * input_img_size
+    target_xyxys[:, 2:4] += target_xyxys[:, 0:2]
 
     pred, layer_vals = model(imgs)
     loss, loss_items = loss_fn(layer_vals, translated_targets)  # loss scaled by batch_size
@@ -116,13 +128,27 @@ def run_forward_pass(model: Model, imgs: torch.Tensor, targets: torch.Tensor, lo
 
         for i, det_list in enumerate(processed_pred):
             true_class_entries = translated_targets[translated_targets[:, 0] == i][:, 1].type(torch.int64)
+            pred_class_entries = det_list[:, -1].type(torch.int64)
             true_class_counts = torch.bincount(true_class_entries, minlength=len(used_categories))
-            class_counts = torch.bincount(det_list[:, -1].type(torch.int64), minlength=len(used_categories))
+            class_counts = torch.bincount(pred_class_entries, minlength=len(used_categories))
             total_mistakes += torch.abs(true_class_counts - class_counts)
+
+            for cls in range(len(used_categories)):
+                true_class_filter = true_class_entries == cls
+                pred_class_filter = pred_class_entries == cls
+
+                if torch.sum(true_class_filter).item() > 0 and torch.sum(pred_class_filter).item() > 0:
+                    iou_mat = box_iou(target_xyxys[translated_targets[:, 0] == i][true_class_filter],
+                                      det_list[:, :4][pred_class_filter])
+
+                    max_matches = torch.argmax(iou_mat, dim=1)
+                    for this_pred in torch.unique(max_matches):
+                        total_iou_matches[cls] += torch.max(iou_mat[max_matches == this_pred, this_pred])
+
             # print(f'Image {i}: Found {det_list[:, -1]}')
 
     all_true_class_counts = torch.bincount(translated_targets[:, 1].type(torch.int64), minlength=len(used_categories))
-    return loss, total_mistakes, all_true_class_counts
+    return loss, total_mistakes, total_iou_matches, all_true_class_counts
 
 
 device = torch.device('cuda:0')
@@ -145,7 +171,7 @@ batch_size = 16
 offline_categories = 5
 total_epochs = 80
 val_interval = 1
-val_size = 20
+val_size = 10
 max_replay_cache_size = 50
 online_add_size = 10
 rng = np.random.default_rng()
@@ -157,7 +183,8 @@ ch = 3
 
 if __name__ == '__main__':
     # torch.set_printoptions(profile='full')
-    csv_logger = CSVLogger('./output.csv')
+    train_csv_logger = CSVLogger('./train.csv')
+    val_csv_logger = CSVLogger('./val.csv')
 
     saved_model = torch.load(base_weights_path, map_location='cpu')
     saved_model_state = saved_model['model'].float().state_dict()
@@ -278,6 +305,7 @@ if __name__ == '__main__':
         losses = []
         total_mistakes = torch.zeros((len(used_categories),), dtype=torch.int64, device=device)
         total_labels = torch.clone(total_mistakes)
+        total_iou_matches = torch.zeros((len(used_categories),), dtype=torch.float, device=device)
 
         # train_conf_mat = torch.zeros(offline_categories, offline_categories, dtype=torch.int64)
 
@@ -286,8 +314,9 @@ if __name__ == '__main__':
             targets = filter_image_labels(used_categories, targets)
             optimizer.zero_grad()
 
-            loss, mistakes, these_class_counts = run_forward_pass(base_model, imgs, targets, loss_fn)
+            loss, mistakes, iou_matches, these_class_counts = run_forward_pass(base_model, imgs, targets, loss_fn)
             total_mistakes += mistakes
+            total_iou_matches += iou_matches
             total_labels += these_class_counts
             losses.append(loss)
 
@@ -296,17 +325,19 @@ if __name__ == '__main__':
 
         # total_labels = sum(targets.shape[0] for _, targets, _ in replay_cache)
 
-        log_items = {'epoch': epoch, 'total_mistakes': torch.sum(total_mistakes).item(),
-                     'total_labels': torch.sum(total_labels).item(), 'total_losses': sum(losses).item(),
-                     'num_classes': len(used_categories), 'class_set': used_categories}
-        csv_logger.log(log_items)
+        log_items = {'epoch': epoch, 'mistake_counts': values_of(total_mistakes),
+                     'iou_totals': values_of(total_iou_matches),
+                     'label_counts': values_of(total_labels), 'total_losses': sum(losses).item(),
+                     'class_set': used_categories}
+        train_csv_logger.log(log_items)
 
         print(f'Epoch {epoch} training: Mistake breakdown: {torch.div(total_mistakes, total_labels)} ({torch.sum(total_mistakes).item()} '
-              f'total mistakes, {torch.sum(total_labels).item()} total '
+              f'total mistakes, IOU match breakdown: {torch.div(total_iou_matches, total_labels)}, {torch.sum(total_labels).item()} total '
               f'labels, total losses: {sum(losses).item()})')
 
         if (epoch + 1) % val_interval == 0:
             total_mistakes = torch.zeros((len(used_categories),), dtype=torch.int64, device=device)
+            total_iou_matches = torch.zeros((len(used_categories),), dtype=torch.float, device=device)
             total_labels = torch.clone(total_mistakes)
             losses = []
 
@@ -315,17 +346,25 @@ if __name__ == '__main__':
                 targets = filter_image_labels(used_categories, targets)
 
                 with torch.no_grad():
-                    loss, mistakes, these_class_counts = run_forward_pass(base_model, imgs, targets, loss_fn)
+                    loss, mistakes, iou_matches, these_class_counts = run_forward_pass(base_model, imgs, targets, loss_fn)
 
                 total_mistakes += mistakes
+                total_iou_matches += iou_matches
                 total_labels += these_class_counts
                 losses.append(loss)
 
             print(f'Epoch {epoch} validation: Mistake breakdown: {torch.div(total_mistakes, total_labels)} ({torch.sum(total_mistakes).item()} '
-                  f'total mistakes, {torch.sum(total_labels).item()} total '
+                  f'total mistakes, IOU match breakdown: {torch.div(total_iou_matches, total_labels)}, {torch.sum(total_labels).item()} total '
                   f'labels, total losses: {sum(losses).item()})')
+
+            log_items = {'epoch': epoch, 'mistake_counts': values_of(total_mistakes),
+                         'iou_totals': values_of(total_iou_matches),
+                         'label_counts': values_of(total_labels), 'total_losses': sum(losses).item(),
+                         'class_set': used_categories}
+            val_csv_logger.log(log_items)
 
     # tl_train_cache = [base_model(batch_info[0].to(device).float() / 255).cpu() for batch_info in
     #                   tqdm.tqdm(train_loader, desc="Caching forward values for transfer learning...")]
 
-    csv_logger.close()
+    train_csv_logger.close()
+    val_csv_logger.close()

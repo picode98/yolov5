@@ -8,9 +8,10 @@ class CSVLogger:
         self.delim = delim
 
     def escape(self, value: str):
-        for seq in ['\\', self.delim]:
-            value = value.replace(seq, '\\' + seq)
-        return value
+        if self.delim in value or '"' in value:
+            return '"' + value.replace('"', '""') + '"'
+        else:
+            return value
 
     def log(self, data: Dict[str, Any]):
         if self.col_headers is None:
