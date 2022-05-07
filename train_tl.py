@@ -1,5 +1,8 @@
 import itertools
+import pathlib
 import sys
+from copy import deepcopy
+from datetime import datetime
 from typing import List, Iterable, Iterator, Optional, Sized, Set
 
 import numpy as np
@@ -12,7 +15,7 @@ import yaml
 
 from models.yolo import Model, Detect
 from utils.datasets import create_dataloader, LoadImagesAndLabels
-from utils.general import check_img_size, non_max_suppression
+from utils.general import check_img_size, non_max_suppression, increment_path
 from utils.loss import ComputeLoss
 from utils.loggers.csv import CSVLogger
 import val
@@ -54,7 +57,7 @@ def item_labeler(collection, label):
 def most_common_categories(dataset: LoadImagesAndLabels):
     all_labels = np.concatenate([dataset.labels[idx][:, 0] for idx in dataset.indices], axis=0).astype('int64')
     label_counts = np.bincount(all_labels)
-    return np.argsort(label_counts)[::-1]
+    return list(np.argsort(label_counts)[::-1])
 
 
 class ImageLabelSampler(torch.utils.data.Sampler):
@@ -112,12 +115,14 @@ def values_of(t: torch.Tensor):
 def run_forward_pass(model: Model, imgs: torch.Tensor, targets: torch.Tensor, loss_fn: ComputeLoss):
     total_mistakes = torch.zeros((len(used_categories),), dtype=torch.int64, device=imgs.device)
     total_iou_matches = torch.zeros((len(used_categories),), dtype=torch.float, device=imgs.device)
+    dataset_labels_to_new_labels = {val: idx for idx, val in enumerate(used_categories)}
 
     translated_targets = torch.clone(targets)
     translated_targets[:, 1].apply_(dataset_labels_to_new_labels.get)
     translated_targets = translated_targets.to(device)
 
     target_xyxys = torch.clone(translated_targets[:, 2:6]) * input_img_size
+    target_xyxys[:, 0:2] -= (target_xyxys[:, 2:4] / 2.0)
     target_xyxys[:, 2:4] += target_xyxys[:, 0:2]
 
     pred, layer_vals = model(imgs)
@@ -151,25 +156,34 @@ def run_forward_pass(model: Model, imgs: torch.Tensor, targets: torch.Tensor, lo
     return loss, total_mistakes, total_iou_matches, all_true_class_counts
 
 
+def save_checkpoint(model: torch.nn.Module, optimizer: torch.optim.Optimizer, epoch: int,
+                    filepath: str):
+    ckpt = {
+        'epoch': epoch,
+        'best_fitness': None,
+        'model': deepcopy(model).half(),
+        'ema': None,
+        'updates': None,
+        'optimizer': optimizer.state_dict(),
+        'wandb_id': None,
+        'date': datetime.now().isoformat()
+    }
+
+    torch.save(ckpt, filepath)
+
+
 device = torch.device('cuda:0')
 
-train_data_file = 'K:\\cse583\\project_data\\VOC\\images\\train2007'
-val_data_file = 'K:\\cse583\\project_data\\VOC\\images\\val2007'
+data_manifest_path = './data/VOC.yaml'
 base_model_path = './models/yolov5s_tl_base.yaml'
 base_weights_path = './yolov5s.pt'
-
-detection_anchors = [
-    [10,13, 16,30, 33,23],  # P3/8
-    [30,61, 62,45, 59,119],  # P4/16
-    [116,90, 156,198, 373,326]  # P5/32
-]
 
 model_hyp_file = './data/hyps/hyp.scratch-low.yaml'
 
 input_img_size = 640
-batch_size = 16
+batch_size = 32
 offline_categories = 5
-total_epochs = 80
+total_epochs = 99
 val_interval = 1
 val_size = 10
 max_replay_cache_size = 50
@@ -183,8 +197,9 @@ ch = 3
 
 if __name__ == '__main__':
     # torch.set_printoptions(profile='full')
-    train_csv_logger = CSVLogger('./train.csv')
-    val_csv_logger = CSVLogger('./val.csv')
+    out_dir = increment_path('./runs/train_tl/exp', mkdir=True)
+    train_csv_logger = CSVLogger(out_dir / './train.csv')
+    val_csv_logger = CSVLogger(out_dir / './val.csv')
 
     saved_model = torch.load(base_weights_path, map_location='cpu')
     saved_model_state = saved_model['model'].float().state_dict()
@@ -220,13 +235,22 @@ if __name__ == '__main__':
     # stride = torch.tensor([s / x.shape[-2] for x in detection_layer.forward(base_model.forward(torch.zeros(1, ch, s, s)))])
     # gs = max(int(stride.max()), 32)  # grid size (max stride)
     # imgsz = check_img_size(input_img_size, gs, floor=gs * 2)  # verify imgsz is gs-multiple
+    with open(data_manifest_path, 'r', encoding='utf8') as manifest_file:
+        dataset_info = yaml.safe_load(manifest_file)
 
-    train_loader, train_dataset = create_dataloader(train_data_file, input_img_size, batch_size, 32, workers=0,
+    root_ds_path = pathlib.Path(dataset_info['path'])
+    train_paths = root_ds_path / pathlib.Path(dataset_info['train']) if isinstance(dataset_info['train'], str) \
+                    else [root_ds_path / pathlib.Path(subpath) for subpath in dataset_info['train']]
+    val_paths = root_ds_path / pathlib.Path(dataset_info['val']) if isinstance(dataset_info['val'], str) \
+                    else [root_ds_path / pathlib.Path(subpath) for subpath in dataset_info['val']]
+
+    train_loader, train_dataset = create_dataloader(train_paths, input_img_size, batch_size, 32, workers=0,
                                                     sampler=lambda dataset: ImageLabelSampler(dataset, set()))
-    val_loader, val_dataset = create_dataloader(val_data_file, input_img_size, batch_size, 32, workers=0,
+    val_loader, val_dataset = create_dataloader(val_paths, input_img_size, batch_size, 32, workers=0,
                                                     sampler=lambda dataset: ImageLabelSampler(dataset, set()))
     sorted_categories = most_common_categories(train_dataset)
-    used_categories = set(sorted_categories[:offline_categories])
+    used_categories = sorted_categories[:offline_categories]
+    base_model.names = [dataset_info['names'][i] for i in used_categories]
 
     train_loader.sampler.update_categories(train_dataset, used_categories)
     train_loader.sampler.img_idx_list = resample(train_loader.sampler.img_idx_list, max_replay_cache_size * batch_size)
@@ -234,8 +258,6 @@ if __name__ == '__main__':
 
     val_loader.sampler.update_categories(val_dataset, used_categories)
     val_loader.sampler.img_idx_list = resample(val_loader.sampler.img_idx_list, val_size * batch_size)
-
-    dataset_labels_to_new_labels = {ds_label: idx for idx, ds_label in enumerate(used_categories)}
 
     # all_labels = np.concatenate([dataset.labels[idx][:, 0] for idx in dataset.indices], axis=0).astype('int64')
     # label_counts = np.bincount(all_labels)
@@ -275,8 +297,9 @@ if __name__ == '__main__':
         if categories_to_add > 0:
             print(f'Adding {categories_to_add} {"category" if categories_to_add == 1 else "categories"}...')
 
-            new_category_set = set(sorted_categories[len(used_categories):len(used_categories) + categories_to_add])
-            used_categories.update(new_category_set)
+            new_category_set = sorted_categories[len(used_categories):len(used_categories) + categories_to_add]
+            used_categories += new_category_set
+
             train_loader.sampler.update_categories(train_dataset, used_categories)
             train_loader.sampler.img_idx_list = resample([idx for idx in train_loader.sampler.img_idx_list
                                                           if idx not in used_train_images], online_add_size * batch_size)
@@ -285,13 +308,9 @@ if __name__ == '__main__':
             val_loader.sampler.update_categories(val_dataset, used_categories)
             val_loader.sampler.img_idx_list = resample(val_loader.sampler.img_idx_list, val_size * batch_size)
 
-            for category in new_category_set:
-                assert category not in dataset_labels_to_new_labels
-                dataset_labels_to_new_labels[category] = len(dataset_labels_to_new_labels)
-
-            assert len(dataset_labels_to_new_labels) == len(used_categories)
-
             base_model.model[-1].set_num_classes(len(used_categories))
+            base_model.names = [dataset_info['names'][i] for i in used_categories]
+
             loss_fn = ComputeLoss(base_model)
             optimizer = SGD(base_model.parameters(), lr=base_model.hyp['lr0'])
             replay_cache += [(imgs, targets, paths) for (imgs, targets, paths, _)
@@ -334,6 +353,8 @@ if __name__ == '__main__':
         print(f'Epoch {epoch} training: Mistake breakdown: {torch.div(total_mistakes, total_labels)} ({torch.sum(total_mistakes).item()} '
               f'total mistakes, IOU match breakdown: {torch.div(total_iou_matches, total_labels)}, {torch.sum(total_labels).item()} total '
               f'labels, total losses: {sum(losses).item()})')
+
+        save_checkpoint(base_model, optimizer, epoch, out_dir / f'./epoch-{epoch}.pt')
 
         if (epoch + 1) % val_interval == 0:
             total_mistakes = torch.zeros((len(used_categories),), dtype=torch.int64, device=device)
